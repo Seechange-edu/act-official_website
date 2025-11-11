@@ -33,13 +33,16 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: yarn
+          cache: 'pnpm'
 
-      - name: Build Yarn
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Build with pnpm
         run: |
-          yarn --frozen-lockfile
+          pnpm install --frozen-lockfile
           cp ./env/${{ env.PUSHREF }}.env .env.production
-          yarn build
+          pnpm build
 
       - name: Build and push Docker image
         run: |
