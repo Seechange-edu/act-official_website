@@ -40,10 +40,9 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
-      - name: Build with pnpm
+      - name: Install and build
         run: |
           pnpm install --frozen-lockfile
-          cp ./env/${{ env.PUSHREF }}.env .env.production
           pnpm build
 
       - name: Build and push Docker image
