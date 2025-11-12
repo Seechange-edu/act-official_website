@@ -40,13 +40,30 @@ jobs:
           node-version: ${{ vars.NODE_VERSION }}
           cache: 'pnpm'
 
-      - name: Install and build
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
         env:
           DOCKER_BUILD: "true"
           NODE_ENV: production
+        run: pnpm build
+
+      - name: Verify build output
         run: |
-          pnpm install --frozen-lockfile
-          pnpm build
+          echo "Checking build artifacts..."
+          if [ ! -d ".next/static" ]; then
+            echo "❌ Error: .next/static directory not found!"
+            exit 1
+          fi
+          if [ ! -d ".next/standalone" ]; then
+            echo "❌ Error: .next/standalone directory not found!"
+            exit 1
+          fi
+          echo "✅ Build artifacts verified:"
+          ls -la .next/
+          echo "✅ Standalone contents:"
+          ls -la .next/standalone/
 
       - name: Build and push Docker image
         run: |
