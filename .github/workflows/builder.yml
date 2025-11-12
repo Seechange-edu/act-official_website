@@ -91,32 +91,32 @@ jobs:
             docker image prune --force
             docker container prune --force
 
-  notify-teams:
-    if: always()
-    needs: [ action_trigger ]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send Teams Notification
-        env:
-          WEBHOOK: ${{ vars.TEAMS_WEBHOOK_URL }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
-            "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
-            "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
-            "sections": [{
-              "facts": [
-                { "name": "Repository", "value": "${{ github.repository }}" },
-                { "name": "Triggered by", "value": "${{ github.event_name }}" },
-                { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
-                { "name": "Author", "value": "@${{ github.actor }}" },
-                { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
-              ],
-              "text": "[View Workflow Run](${{ env.RUN_URL }})"
-            }]
-          }' \
-          "$WEBHOOK"
+  # notify-teams:
+  #   if: always()
+  #   needs: [ action_trigger ]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Send Teams Notification
+  #       env:
+  #         WEBHOOK: ${{ vars.TEAMS_WEBHOOK_URL }}
+  #         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #       run: |
+  #         curl -X POST -H "Content-Type: application/json" \
+  #         -d '{
+  #           "@type": "MessageCard",
+  #           "@context": "http://schema.org/extensions",
+  #           "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
+  #           "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
+  #           "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
+  #           "sections": [{
+  #             "facts": [
+  #               { "name": "Repository", "value": "${{ github.repository }}" },
+  #               { "name": "Triggered by", "value": "${{ github.event_name }}" },
+  #               { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
+  #               { "name": "Author", "value": "@${{ github.actor }}" },
+  #               { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
+  #             ],
+  #             "text": "[View Workflow Run](${{ env.RUN_URL }})"
+  #           }]
+  #         }' \
+  #         "$WEBHOOK"
