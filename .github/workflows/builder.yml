@@ -45,7 +45,7 @@ jobs:
 
       - name: Build
         env:
-          DOCKER_BUILD: "true"
+          DOCKER_BUILD: true
           NODE_ENV: production
         run: pnpm build
 
