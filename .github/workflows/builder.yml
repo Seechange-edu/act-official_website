@@ -50,7 +50,9 @@ jobs:
         env:
           DOCKER_BUILD: "true"
           NODE_ENV: production
-        run: pnpm build
+        run: |
+          cp ./env/dev.env .env.production
+          pnpm build
 
       - name: Verify build output
         run: |
