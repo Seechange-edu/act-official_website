@@ -17,6 +17,18 @@ jobs:
       contents: read    # Required for actions/checkout
     strategy:
       fail-fast: false
+    # Exposed so prune-images / notify-teams can run as separate jobs without re-parsing the Release.
+    # active drives per-environment selection (prod vs dev/uat) of host / key / webhook downstream.
+    outputs:
+      active: ${{ steps.deploy-vars.outputs.active }}
+      image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+      source_repo: ${{ steps.relinfo.outputs.source_repo }}
+      commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
+      commit_short: ${{ steps.relinfo.outputs.commit_short }}
+      commit_message: ${{ steps.relinfo.outputs.commit_message }}
+      commit_url: ${{ steps.relinfo.outputs.commit_url }}
+      release_notes: ${{ steps.relinfo.outputs.release_notes }}
 
     steps:
       - name: get tag info
@@ -25,12 +37,56 @@ jobs:
           githubToken: ${{ secrets.ACTION_TOKEN }}
           type: parse
 
+      # Runs before the build so notify-teams still has the tag/active when a later step fails.
+      # For prod the image is tagged with the release tag (BRANCH); dev/uat keep the rolling :latest.
+      - name: Export deploy vars
+        id: deploy-vars
+        run: |
+          if [ "${{ env.ACTIVE }}" = "prod" ]; then
+            IMAGE_TAG="${{ env.BRANCH }}"
+          else
+            IMAGE_TAG="latest"
+          fi
+          {
+            echo "active=${{ env.ACTIVE }}"
+            echo "image_tag=${IMAGE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: SeeChange-edu/${{ env.REPOSITORY }}
           token: ${{ secrets.ACTION_TOKEN }}
           ref: ${{ env.BRANCH }}
+
+      # Commit + release notes for the Teams card. Runs before the build so a failed build still notifies with context.
+      - name: Collect commit and release info
+        id: relinfo
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          SRC_REPO: SeeChange-edu/${{ env.REPOSITORY }}
+          REF: ${{ env.BRANCH }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          SUBJECT=$(git log -1 --pretty=%s)
+          # Release notes exist only when BRANCH is a release tag (prod); empty for branch deploys (dev/uat).
+          NOTES=$(gh release view "$REF" --repo "$SRC_REPO" --json body -q .body 2>/dev/null | head -c 1500 || true)
+          # Fallback text keeps the card's notes block non-empty (avoids relying on Adaptive Card isVisible).
+          if [ -z "$NOTES" ]; then NOTES="_(no release notes — branch deploy)_"; fi
+          D=$(openssl rand -hex 8)
+          {
+            echo "source_repo=$SRC_REPO"
+            echo "commit_sha=$SHA"
+            echo "commit_short=$SHORT"
+            echo "commit_url=${{ github.server_url }}/$SRC_REPO/commit/$SHA"
+            echo "commit_message<<$D"
+            echo "$SUBJECT"
+            echo "$D"
+            echo "release_notes<<$D"
+            echo "$NOTES"
+            echo "$D"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -51,7 +107,12 @@ jobs:
           DOCKER_BUILD: "true"
           NODE_ENV: production
         run: |
-          cp ./env/dev.env .env.production
+          # prod bakes prod.env; dev/uat share dev.env (there is no uat.env).
+          if [ "${{ env.ACTIVE }}" = "prod" ]; then
+            cp ./env/prod.env .env.production
+          else
+            cp ./env/dev.env .env.production
+          fi
           pnpm build
 
       - name: Verify build output
@@ -85,16 +146,12 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.deploy-vars.outputs.image_tag }}
         run: |
-          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:latest"
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:${IMAGE_TAG}"
           docker build --tag ${IMAGE_URI} --file Dockerfile-Self .
           docker push ${IMAGE_URI}
           echo "IMAGE_URI=${IMAGE_URI}" >> $GITHUB_ENV
-        # run: |
-        #       echo ${{ secrets.TOKEN }} | docker login registry.digitalocean.com \
-        #       -u "${{ vars.DO_DOCR_LOGIN_EMAIL }}" --password-stdin
-        #       docker build --tag ${{ env.IMAGE }} --file Dockerfile-Self .
-        #       docker push ${{ env.IMAGE }}
 
       - name: Get ECR login token
         id: ecr-login-token
@@ -106,21 +163,25 @@ jobs:
 
       - name: SSH and Run Docker image
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
+          IMAGE_URI: ${{ env.IMAGE_URI }}
         with:
-          host: ${{ vars.REMOTE_HOST }}
+          # prod deploys to the separate prod server with the prod key; dev/uat use the shared dev host/key.
+          host: ${{ env.ACTIVE == 'prod' && vars.AWS_PRODUCTION_SERVER_IP || vars.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
-          key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_REPOSITORY,ECR_TOKEN
+          key: ${{ env.ACTIVE == 'prod' && secrets.REMOTE_AWS_PROD_PRIVATE_SSH_KEY || secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_TOKEN,IMAGE_URI
           script: |
             # Login to AWS ECR using temporary token from GitHub Actions
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-            
-            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:latest"
+
             docker pull ${IMAGE_URI}
-            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.PREV_NAME }})" -gt 0 ]; then 
+            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.PREV_NAME }})" -gt 0 ]; then
               docker rm -f ${{ env.PREV_NAME }}
             fi
-            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then 
+            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then
               docker rm -f ${{ env.NAME }}
             fi
             docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} --restart unless-stopped ${IMAGE_URI}
@@ -128,24 +189,26 @@ jobs:
             # Disabled: the old container is already removed by name above, and pruning here would delete
             # a container that crashed on startup, taking its logs with it.
             # docker container prune --force
-        env:
-          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
-          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
 
+  # Housekeeping only: never fails the run.
+  prune-images:
+    needs: [action_trigger]
+    if: needs.action_trigger.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
       - name: Prune old semver Docker images
-        if: success()
-        continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         env:
-          ECR_REGISTRY: ${{ steps.login-pf-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ needs.action_trigger.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ env.BRANCH }}
-          ACTIVE: ${{ env.ACTIVE }}
+          IMAGE_TAG: ${{ needs.action_trigger.outputs.image_tag }}
+          ACTIVE: ${{ needs.action_trigger.outputs.active }}
         with:
-          host: ${{ vars.REMOTE_HOST }}
+          # Same host/key selection as the deploy so we prune on the server we just deployed to.
+          host: ${{ needs.action_trigger.outputs.active == 'prod' && vars.AWS_PRODUCTION_SERVER_IP || vars.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
-          key: ${{ secrets.REMOTE_SSH_KEY }}
+          key: ${{ needs.action_trigger.outputs.active == 'prod' && secrets.REMOTE_AWS_PROD_PRIVATE_SSH_KEY || secrets.REMOTE_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ACTIVE
           script: |
             IMAGE_PREFIX="${ECR_REGISTRY}/${ECR_REPOSITORY}/${ACTIVE}"
@@ -166,7 +229,7 @@ jobs:
 
             PREV=$(printf '%s\n' "${TAGS[@]}" | sort -V | awk -v cur="$CURRENT" '
               { a[++n]=$0 }
-              END { for(i=1;i<=n;i++) if(a[i]==cur && i>1) { print a[i-1]; exit } }'))
+              END { for(i=1;i<=n;i++) if(a[i]==cur && i>1) { print a[i-1]; exit } }')
 
             if [ -n "$PREV" ]; then
               echo "Keep: ${CURRENT}, ${PREV}"
@@ -181,58 +244,102 @@ jobs:
               docker rmi "${IMAGE_PREFIX}:${tag}" 2>/dev/null || true
             done
 
-      # - name: Build and push Docker image
-      #   run: |
-      #     echo ${{ secrets.DO_DOCR_TOKEN }} | docker login registry.digitalocean.com \
-      #     -u "${{ vars.DO_DOCR_LOGIN_EMAIL }}" --password-stdin
-      #     docker build --tag ${{ env.IMAGE }} --file Dockerfile-Self .
-      #     docker push ${{ env.IMAGE }}
-
-      # - name: SSH and Run Docker image
-      #   uses: appleboy/ssh-action@v1.2.0
-      #   with:
-      #     host: ${{ vars.REMOTE_HOST }}
-      #     username: ${{ vars.REMOTE_USER }}
-      #     key: ${{ secrets.REMOTE_SSH_KEY }}
-      #     script: |
-      #       # remote env needs to login too
-      #       echo ${{ secrets.DO_DOCR_TOKEN }} | docker login registry.digitalocean.com \
-      #         -u "${{ vars.DO_DOCR_LOGIN_EMAIL }}" --password-stdin
-            
-      #       docker pull ${{ env.IMAGE }}
-      #       if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then 
-      #         docker rm -f ${{ env.NAME }}
-      #       fi
-      #       docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} --restart unless-stopped ${{ env.IMAGE }}
-      #       docker image prune --force
-      #       docker container prune --force
-
-  # notify-teams:
-  #   if: always()
-  #   needs: [ action_trigger ]
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Send Teams Notification
-  #       env:
-  #         WEBHOOK: ${{ vars.TEAMS_WEBHOOK_URL }}
-  #         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-  #       run: |
-  #         curl -X POST -H "Content-Type: application/json" \
-  #         -d '{
-  #           "@type": "MessageCard",
-  #           "@context": "http://schema.org/extensions",
-  #           "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
-  #           "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
-  #           "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
-  #           "sections": [{
-  #             "facts": [
-  #               { "name": "Repository", "value": "${{ github.repository }}" },
-  #               { "name": "Triggered by", "value": "${{ github.event_name }}" },
-  #               { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
-  #               { "name": "Author", "value": "@${{ github.actor }}" },
-  #               { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
-  #             ],
-  #             "text": "[View Workflow Run](${{ env.RUN_URL }})"
-  #           }]
-  #         }' \
-  #         "$WEBHOOK"
+  # Notification only: never fails the run.
+  # Targets the Teams "Workflows" webhook (Post to a channel when a webhook request is received),
+  # which renders the Adaptive Card in attachments[0].content as-is.
+  notify-teams:
+    needs: [action_trigger]
+    if: always() && (vars.TEAMS_WEBHOOK_URL != '' || vars.PROD_TEAMS_WEBHOOK_URL != '')
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Teams notification (Power Automate)
+        env:
+          # prod posts to the prod channel; dev/uat to the shared non-prod channel.
+          WEBHOOK: ${{ needs.action_trigger.outputs.active == 'prod' && vars.PROD_TEAMS_WEBHOOK_URL || vars.TEAMS_WEBHOOK_URL }}
+          STATUS: ${{ needs.action_trigger.result }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REPO: ${{ needs.action_trigger.outputs.source_repo }}
+          ENVIRONMENT: ${{ needs.action_trigger.outputs.active }}
+          TAG: ${{ needs.action_trigger.outputs.image_tag }}
+          COMMIT_SHA: ${{ needs.action_trigger.outputs.commit_sha }}
+          COMMIT_SHORT: ${{ needs.action_trigger.outputs.commit_short }}
+          COMMIT_MESSAGE: ${{ needs.action_trigger.outputs.commit_message }}
+          COMMIT_URL: ${{ needs.action_trigger.outputs.commit_url }}
+          RELEASE_NOTES: ${{ needs.action_trigger.outputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # jq builds the whole Adaptive Card so release notes / commit messages are escaped safely.
+          # The Teams Workflows webhook renders attachments[0].content verbatim.
+          jq -n \
+            --arg status "$STATUS" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg environment "$ENVIRONMENT" \
+            --arg tag "$TAG" \
+            --arg commit_short "$COMMIT_SHORT" \
+            --arg commit_message "$COMMIT_MESSAGE" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg release_notes "$RELEASE_NOTES" \
+            --arg actor "$ACTOR" \
+            --arg event "$EVENT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  msteams: { width: "Full" },
+                  body: [
+                    {
+                      type: "Container",
+                      style: (if $status == "success" then "good" else "attention" end),
+                      bleed: true,
+                      items: [
+                        {
+                          type: "TextBlock",
+                          text: (if $status == "success" then "✅ Deploy succeeded" else "❌ Deploy failed" end),
+                          weight: "Bolder",
+                          size: "Medium",
+                          wrap: true
+                        },
+                        {
+                          type: "TextBlock",
+                          text: ($source_repo + " → " + $environment),
+                          spacing: "None",
+                          isSubtle: true,
+                          wrap: true
+                        }
+                      ]
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        { title: "Environment", value: $environment },
+                        { title: "Tag / Branch", value: $tag },
+                        { title: "Commit", value: ("[" + $commit_short + "](" + $commit_url + ")") },
+                        { title: "Commit message", value: $commit_message },
+                        { title: "Triggered by", value: ($actor + " (" + $event + ")") },
+                        { title: "Result", value: $status }
+                      ]
+                    },
+                    { type: "TextBlock", text: "**Release notes**", wrap: true, spacing: "Medium" },
+                    {
+                      type: "Container",
+                      style: "emphasis",
+                      items: [ { type: "TextBlock", text: $release_notes, wrap: true } ]
+                    }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "View workflow run", url: $run_url },
+                    { type: "Action.OpenUrl", title: "View commit", url: $commit_url }
+                  ]
+                }
+              }]
+            }' \
+          | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"
